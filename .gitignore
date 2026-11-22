@@ -1,0 +1,14 @@
+# Base de datos con usuarios y claves
+ecotech.db
+# Registro de errores
+errores.log
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+# Variables de entorno y llaves secretas
+.env
+llave.txt
+# Entorno virtual
+.venv/
+env/
+venv/

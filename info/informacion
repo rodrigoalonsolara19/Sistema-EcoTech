@@ -1,0 +1,217 @@
+# Prompts de Inteligencia Artificial utilizados durante el desarrollo
+
+## Etapa 1: Base POO, SQLite y DAO
+"¿Cómo traduzco un diagrama de clases UML a la sintaxis POO en Python utilizando encapsulamiento estricto con @property y @atributo.setter?"
+
+"Genera una estructura de clases en Python para Empleado, Departamento, Usuario y Proyecto con atributos privados usando __."
+
+"¿Cuál es la forma segura y oficial de conectar Python con una base de datos SQLite sin usar librerías externas?"
+
+"Revisa esta clase DAO y dime cómo puedo parametrizar las consultas SQL para evitar ataques de Inyección SQL."
+
+"¿Cómo manejo las excepciones sqlite3.Error e IntegrityError (como claves foráneas no encontradas) en los bloques try-except-finally?"
+
+"Analiza este error en mi controlador: '<' not supported between instances of 'str' and 'int' y dime cómo corregir la conversión del tipo de dato."
+
+"¿Cómo debo configurar la instrucción PRAGMA foreign_keys = ON; en sqlite3 para que se respeten las claves foráneas en la base de datos?"
+
+## Etapa 2: Consumo de API Externa, Seguridad, Variables de Entorno y Cifrado (Evaluación 3)
+
+### Prompt 1 — Consumo HTTP resiliente de APIs económicas
+Prompt:
+"Necesito consumir la API pública de mindicador.cl en Python usando solo librería estándar, con timeout, reintentos ante fallos temporales, respaldo si la API principal cae y una jerarquía propia de excepciones para no mostrar errores técnicos al usuario."
+
+Respuesta resumida de la IA:
+- Sugirió `urllib.request` y `urllib.error` con `Request(..., headers={"Accept": "application/json"})` y `urlopen(..., timeout=10)`.
+- Propuso la jerarquía `ErrorAPI` -> `ErrorRed`, `ErrorHTTP`, `ErrorFormato`.
+- Propuso reintentar con backoff exponencial (`2 ** intento`) solo en códigos `429` y `>= 500` o fallos de red (`URLError`, `TimeoutError`), cortando de inmediato en `404` y otros `4xx`.
+- Implementó una lista ordenada `FUENTES` (`mindicador.cl` y respaldo `findic.cl`) y el método `__limpiar()` para extraer únicamente `nombre`, `unidad_medida`, `fecha` y `valor`.
+
+### Prompt 2 — Validación y saneamiento de entradas hacia la API
+Prompt:
+"Crea un módulo validador para las consultas de indicadores económicos que bloquee indicadores desconocidos, fechas inválidas o futuras, años fuera de rango y montos inválidos o infinitos."
+
+Respuesta resumida de la IA:
+- Propuso `utils/validador_api.py` con diccionario de lista blanca `INDICADORES_PERMITIDOS` (`uf`, `utm`, `dolar`, `euro`), función `sanear_texto()` (`strip().lower()`), validación por regex (`^\d{2}-\d{2}-\d{4}$` y `^\d{4}$`), verificación de calendario real con `datetime.strptime` (rango 1990 hasta hoy) y validación numérica con `math.isfinite()` y tope máximo.
+
+### Prompt 3 — Variables de entorno sin dependencias externas y depuración de BD
+Prompt:
+"¿Por qué falla la opción Listar Usuarios con ValueError en normalizar_rol? ¿Y cómo cargo variables desde .env sin depender de librerías externas si alguien abre el proyecto en otro PC?"
+
+Respuesta resumida de la IA:
+- Diagnosticó que la tabla `usuario` en `ecotech.db` contenía roles antiguos (`'Ingeniero'`, `'Dev. Cibeerseguridad'`, `'Ceo tea del inacap'`) fuera de la lista permitida (`ADMINISTRADOR`, `GERENTE`, `EMPLEADO`).
+- Indicó actualizar los registros en SQLite, proteger el bucle `for` en `DAOUsuarios.listar_todos` con `try/except ValueError` interno para no abortar el listado completo, y crear `utils/config.py` (`cargar_env()`) para leer `.env` antes de importar los servicios.
+
+### Prompt 4 — Migración de PBKDF2-HMAC-SHA256 a bcrypt
+Prompt:
+"Quiero migrar el hashing de contraseñas a bcrypt sin bloquear las cuentas ya registradas en ecotech.db ni romper por el límite de 72 bytes de bcrypt."
+
+Respuesta resumida de la IA:
+- Propuso usar `bcrypt.hashpw(clave_bytes, bcrypt.gensalt(rounds=12))` en `Usuario.generar_hash_clave`, validar el límite de 72 bytes UTF-8 en `utils/validaciones.py` (`validar_clave`) y mantener verificación compatible en `Usuario.verificar_clave` junto con actualización automática a `bcrypt` al iniciar sesión en `DAOUsuarios.autenticar`.
+
+---
+
+# Decisiones Técnicas del Equipo
+
+Patrón de Arquitectura MVC + DAO + Servicio: Separamos la interfaz de consola (`vista/`), la lógica de validación y permisos (`controlador/`), el consumo de servicios externos (`servicio/`), el acceso a datos (`dao/`) y las entidades (`modelo/`).
+
+Centralización de la Base de Datos: Creamos `ConexionBD` en `conex/conn.py` para gestionar la apertura/cierre de `ecotech.db` (configurable mediante `ECOTECH_DB`), activar `PRAGMA foreign_keys = ON;` e inicializar las 6 tablas.
+
+Seguridad contra Inyección SQL: Todas las consultas en la capa DAO utilizan marcadores de posición parametrizados (`?`) en lugar de concatenación de cadenas.
+
+Encapsulamiento y Validaciones en Modelos: Protegimos los atributos con `__` y validaciones en `@setter` y controladores.
+
+Roles, Autenticación y Cifrado: El sistema exige crear un Administrador inicial si no existe ninguno y obliga a iniciar sesión antes de acceder al menú principal. Los empleados quedan restringidos al Portal del Empleado. La autorización se verifica en dos capas (vista y `ControladorBase`). Las contraseñas nuevas se almacenan con `bcrypt` (factor de costo 12 y salt aleatoria generada por `bcrypt.gensalt`), y las cuentas previas (texto plano o `PBKDF2-HMAC-SHA256`) se migran automáticamente a `bcrypt` al iniciar sesión.
+
+---
+
+# Análisis Técnico del Funcionamiento (Módulos Nuevos y Seguridad)
+
+1. **`servicio/servicio_indicadores.py` (`ServicioIndicadores`)**:
+   - Construye la petición HTTP con `urllib.request.Request` enviando encabezados `Accept: application/json` y `User-Agent: EcoTech-Sistema/1.0`.
+   - Usa `timeout=API_TIMEOUT` (leído desde `.env`, por defecto 10 segundos y mínimo 1) para evitar bloqueos indefinidos.
+   - Implementa un bucle de reintentos (`REINTENTOS = 2`, es decir, hasta 3 intentos) con espera exponencial (`time.sleep(2 ** intento)` → 1s, 2s) únicamente cuando el error es recuperable (`HTTP 429`, `HTTP >= 500`, `URLError` o `TimeoutError`). Ante `HTTP 404` u otros `4xx`, falla de inmediato sin perder tiempo reintentando.
+   - `consultar(ruta)` recorre `FUENTES` (`mindicador.cl` y `findic.cl`): si la fuente principal falla por red, HTTP o formato, registra el detalle técnico en `errores.log` (`logger.error`) y prueba la fuente de respaldo antes de propagar la última `ErrorAPI`.
+   - `__limpiar(datos)` valida que la respuesta sea un `dict` con clave `"serie"` de tipo `list`, convierte cada valor a `float`, descarta elementos corruptos, `NaN`, infinitos (`math.isfinite`) o `<= 0`, trunca la fecha a `YYYY-MM-DD` (`[:10]`) y retorna únicamente `nombre`, `unidad_medida` y `serie`.
+
+2. **`utils/validador_api.py`**:
+   - Aplica defensa preventiva antes de cualquier llamada HTTP: normaliza con `strip().lower()`, restringe los indicadores mediante la lista blanca `INDICADORES_PERMITIDOS`, valida fechas reales con `datetime.strptime` (excluyendo fechas inexistentes como `31-02-2024`, anteriores a 1990 o futuras) y valida que los montos CLP sean finitos, positivos y acotados (`<= 1_000_000_000_000`).
+
+3. **`controlador/controlador_Indc.py` (`ControladorIndicadores`)**:
+   - Verifica sesión activa (`_exige_autenticado()`) en todas las consultas y exige rol Gerente o Administrador (`_exigir_gerente()`) para `convertir_monto()`.
+   - Traduce cada excepción de `ErrorAPI` en mensajes amigables para el usuario final (`__mensaje_error`) sin exponer rutas, URLs internas ni trazas de error.
+
+4. **`utils/config.py` y `.env`**:
+   - `cargar_env()` lee pares `CLAVE=VALOR` desde `.env` al inicio de `main.py` (antes de importar vistas/servicios) y los inyecta en `os.environ` con `os.environ.setdefault`, manteniendo `.env`, `ecotech.db` y `errores.log` fuera del control de versiones mediante `.gitignore`, y documentando las claves requeridas en `.env.example`.
+
+---
+
+# Comparaciones Técnicas (Basadas en Documentación Oficial y OWASP)
+
+1. **`urllib.request` (librería estándar) vs `requests` (externa)**:
+   - Según la documentación oficial de Python, `urllib.request` forma parte de la biblioteca estándar (cero dependencias externas, control explícito de `Request`, encabezados, `timeout` y captura diferenciada de `HTTPError` antes que `URLError`), aunque exige decodificar bytes y llamar a `json.loads()` manualmente; `requests` ofrece una sintaxis más breve (`.json()`, sesiones persistentes), pero exige instalación externa con `pip`.
+   - *Decisión*: Elegimos `urllib.request` para el cliente HTTP porque mantiene el consumo de API libre de dependencias externas y nos obliga a controlar explícitamente decodificación UTF-8, códigos HTTP y timeouts.
+
+2. **`bcrypt` vs `PBKDF2-HMAC-SHA256` (Guía OWASP Password Storage Cheat Sheet)**:
+   - Según OWASP, `PBKDF2-HMAC-SHA256` es puramente dependiente de CPU (vulnerable a paralelización en GPU/ASIC si no usa >= 600.000 iteraciones) y acepta entradas largas sin límite de 72 bytes; `bcrypt` (basado en el cifrado Blowfish) incorpora un factor de costo configurable (`rounds=12`) y sal automática, pero tiene un **límite estricto de 72 bytes**: las implementaciones estándar truncan silenciosamente o rechazan claves más largas, lo que permite que dos contraseñas distintas que comparten los primeros 72 bytes coincidan si no se controla.
+   - *Decisión*: Migramos de `PBKDF2` (310.000 iteraciones) a `bcrypt` (`rounds=12`) y, siguiendo la recomendación de OWASP contra el truncamiento silencioso y contra el pre-hashing ingenuo (que puede introducir fallos con bytes nulos), imponemos explícitamente el máximo de **72 bytes UTF-8** y el rechazo de `\x00` en `utils/validaciones.py` (`validar_clave`) y `modelo/usuario.py`. Además conservamos verificación temporal de `PBKDF2` en `DAOUsuarios.autenticar` para migrar cuentas antiguas a `bcrypt` de forma transparente al iniciar sesión.
+
+3. **Cargador propio `utils/config.py` vs `python-dotenv`**:
+   - `python-dotenv` soporta sintaxis avanzada (expansión de variables, multilínea), pero requiere instalación externa. Un lector propio de `.env` con `pathlib` y `os.environ.setdefault` resuelve la carga de variables simples `CLAVE=VALOR` en ~12 líneas de librería estándar sin riesgo de `ModuleNotFoundError`.
+
+4. **`try/except ValueError` dentro del `for` vs fuera del `for` en `DAOUsuarios.listar_todos`**:
+   - Si el `except ValueError` queda fuera del ciclo `for`, un solo registro corrupto interrumpe la iteración y descarta todos los usuarios siguientes del listado. Al colocar `try/except ValueError` dentro del `for`, solo se omite y registra en log (`logger.warning`) el registro inválido y los demás usuarios continúan cargándose, manteniendo `except sqlite3.Error` afuera para fallos de base de datos.
+
+---
+
+# Errores, Redundancias y Vulnerabilidades Detectadas y Corregidas
+
+1. **Bug crítico de `logger` sin importar y formato `$s` en `vista/vista_usuario.py`**:
+   - *Problema*: Si fallaba `autenticar()` con `RuntimeError`, la línea `logger.error("Error de autenticación: $s", e)` habría provocado `NameError: name 'logger' is not defined` y formateo incorrecto.
+   - *Solución*: Se importó `logger` desde `utils.registro`, se corrigió `%s` y se mostró un mensaje seguro al usuario.
+
+2. **Roles heredados inválidos en `ecotech.db` y caída total en `DAOUsuarios.listar_todos`**:
+   - *Problema*: Registros antiguos (`'Ingeniero'`, `'Dev. Cibeerseguridad'`, `'Ceo tea del inacap'`) hacían fallar `normalizar_rol()` con `ValueError`, bloqueando por completo la opción Listar Usuarios y Eliminar Usuario.
+   - *Solución*: Se sanearon los registros en SQLite a roles válidos (`EMPLEADO`) y se protegió la instanciación dentro del bucle `for` con `try/except ValueError` + `logger.warning`, asegurando `return []` en `except Error`.
+
+3. **Archivo `.env` vacío y carga tardía de variables de entorno**:
+   - *Problema*: `.env` existía pero estaba vacío, las URLs de API estaban fijas en el código y el cargador de entorno debía ejecutarse antes de importar `ServicioIndicadores`.
+   - *Solución*: Se creó `utils/config.py` (`cargar_env()`), se invocó al inicio de `main.py` antes de importar vistas/servicios, se completó `.env` + `.env.example` y se protegió `API_TIMEOUT` contra valores no numéricos o negativos.
+
+4. **Errores de integración detectados en revisión (`servicio_indicadores.py` y `controlador_usuario.py`)**:
+   - *Problema*: Se detectó y corrigió una llamada incompleta `urlopen(API_TIMEOUT)` sin el objeto `solicitud`, la ausencia de `raise ultimo_error` al fallar todas las fuentes en `consultar()`, y una validación duplicada/desactualizada de contraseña (`len(clave) < MIN_CLAVE` con mensaje viejo de "8 caracteres") junto a un `strip()` tardío en `registrar_usuario`.
+
+5. **Riesgo de valores `NaN`/`Infinity`, reintentos inútiles en `404` y truncamiento en `bcrypt`**:
+   - *Problema*: `float("nan")` o `float("inf")` pasan conversiones simples en Python; reintentar un `404` desperdicia tiempo y red; contraseñas mayores a 72 bytes en `bcrypt` fallan o truncan.
+   - *Solución*: Se exige `math.isfinite()` en `validador_api.py` y `servicio_indicadores.py`, se corta de inmediato en HTTP `404`, se centralizó `validar_clave()` en `utils/validaciones.py` (14 caracteres mínimo, 72 bytes máximo, sin `\x00`) y se añadió `User-Agent` a las peticiones HTTP.
+
+6. **Validaciones faltantes de fechas y usabilidad en formularios (Proyectos, Tiempo, Asignaciones, Empleados y Usuarios)**:
+   - *Problema*: `ControladorProyecto` aceptaba fechas `DD-MM-AAAA` y `fechaFin` anterior a `fechaInicio`; `ControladorRegistroTiempo` y `ControladorAsignacionProyecto` aceptaban textos como `"2022"` sin formato `AAAA-MM-DD`; y `VistaEmpleado`/`VistaUsuario` pedían todos los campos antes de avisar que uno estaba mal.
+   - *Solución*: Se creó `validar_fecha_iso()` en `utils/validaciones.py`, se agregó `__validar_datos()` en `ControladorProyecto`, se validaron las fechas en Registro de Tiempo y Asignación de Proyectos, se restringió `patronTelefono` a formato chileno de 9 dígitos con `+56` opcional (`r"(?:\+?56)?[2-9]\d{8}"`), y se agregaron validaciones campo por campo al instante en `VistaEmpleado` (`__pedir_valido`) y `VistaUsuario`.
+
+---
+
+# Explicación Detallada Función por Función (Por Qué se Agregó Cada Una)
+
+Esta sección sirve como guía directa para entender exactamente qué hace cada función nueva o refactorizada y **por qué fue necesario agregarla**.
+
+## 1. Arranque y configuración (`main.py` y `utils/config.py`)
+- **`cargar_env(ruta_env=None)`** (`utils/config.py`): Se agregó para leer el archivo `.env` usando solo librería estándar (`pathlib` y `os.environ.setdefault`) sin obligar a instalar `python-dotenv`. Se ejecuta en las primeras líneas de `main.py`, **antes** de importar vistas y servicios, porque `ServicioIndicadores` lee `os.getenv(...)` al momento de cargarse en memoria.
+- **`mostrar_perfil(usuario)`** (`main.py`): Muestra los datos del empleado cuando un usuario con rol `EMPLEADO` entra al Portal del Empleado. Verifica primero `if empleado is None` para evitar un `AttributeError` si una cuenta de usuario no tiene empleado asociado.
+- **`main()`** (`main.py`): Inicializa tablas (`ConexionBD().inicializar_tablas()`), verifica si existe al menos un Administrador (`hay_administradores()`), exige inicio de sesión (`autenticar()`), entrega la sesión activa a cada vista (`configurar_usuario(usuario)`) y separa el menú en dos flujos: Portal restringido para `EMPLEADO` y Menú completo (incluyendo Módulo 7 API) para `GERENTE`/`ADMINISTRADOR`.
+
+## 2. Consumo resiliente de API (`servicio/servicio_indicadores.py`)
+- **Jerarquía `ErrorAPI` -> `ErrorRed`, `ErrorHTTP`, `ErrorFormato`**: Se creó para clasificar el origen exacto de cada fallo (red/timeout, código HTTP 4xx/5xx, o JSON corrupto) y permitir que el controlador entregue mensajes seguros al usuario sin mostrar trazas ni excepciones técnicas.
+- **`__pedir_json(self, url)`**: Construye la petición con `urllib.request.Request` agregando `Accept: application/json` y `User-Agent: EcoTech-Sistema/1.0`. Usa `timeout=API_TIMEOUT` para evitar bloqueos si el servidor no responde. Captura `HTTPError` antes que `URLError` (porque en Python `HTTPError` hereda de `URLError`): si recibe `404` falla de inmediato porque reintentar un recurso inexistente no tiene sentido; si recibe `429` o `>= 500`, o falla la red (`URLError`, `TimeoutError`), espera `2 ** intento` segundos (backoff exponencial) hasta `REINTENTOS = 2` antes de lanzar el error. Finalmente decodifica UTF-8 y parsea con `json.loads()`.
+- **`__limpiar(self, datos)`**: Se agregó para validar que la respuesta sea un `dict` con lista `"serie"` y eliminar datos sobrantes o corruptos. Convierte `valor` a `float`, verifica `math.isfinite(valor) and valor > 0` (para bloquear `NaN`, `Infinity` o valores negativos), recorta `fecha` a 10 caracteres (`YYYY-MM-DD`) y retorna únicamente `nombre`, `unidad_medida` y `serie`.
+- **`consultar(self, ruta)`**: Implementa tolerancia a fallos (*failover*) recorriendo `FUENTES` (`mindicador.cl` y respaldo `findic.cl`). Si una fuente falla, guarda el detalle en `errores.log` mediante `logger.error` y prueba la siguiente; si todas fallan, relanza `ultimo_error`.
+- **`ultimos_valores(indicador)`, `valor_en_fecha(indicador, fecha)`, `serie_anual(indicador, anio)`**: Métodos públicos limpios que arman la ruta de cada consulta, llaman a `consultar()` y devuelven el resultado ya filtrado por `__limpiar()`.
+
+## 3. Validación y saneamiento para la API (`utils/validador_api.py`)
+- **`sanear_texto(texto)`**: Quita espacios y pasa a minúsculas (`strip().lower()`) antes de validar, evitando rechazos por formato cosmético.
+- **`validar_indicador(texto)`**: Comprueba contra el diccionario de lista blanca `INDICADORES_PERMITIDOS` (`uf`, `utm`, `dolar`, `euro`) para impedir que el usuario inyecte rutas arbitrarias en la URL de la API.
+- **`validar_fecha(texto)`**: Combina regex estricta (`^\d{2}-\d{2}-\d{4}$`) con `datetime.strptime(..., "%d-%m-%Y")` para rechazar fechas inexistentes (como `31-02-2024`), anteriores a 1990 o futuras (`> date.today()`).
+- **`validar_anio(texto)`**: Exige exactamente 4 dígitos (`^\d{4}$`) entre `1990` y el año actual.
+- **`validar_monto(texto)`**: Convierte texto a `float` (aceptando coma o punto), exige `math.isfinite(monto)` y `monto > 0` con tope máximo de `1_000_000_000_000` para evitar divisiones erróneas, `NaN` o desbordamientos.
+
+## 4. Controlador y Vista de API (`controlador/controlador_Indc.py` y `vista/vista_indicadores.py`)
+- **`_exige_autenticado(self)`**: Bloquea cualquier consulta a la API si no hay un usuario con sesión iniciada.
+- **`__ejecutar(self, indicador, consulta)`**: Método interno compartido por `consultar_actuales`, `consultar_fecha` y `consultar_anio` para no repetir la verificación de sesión, validación del indicador y captura de `PermissionError`/`ErrorAPI`.
+- **`convertir_monto(self, monto_texto)`**: Exige rol Gerente o Administrador (`_exigir_gerente()`), valida el monto CLP, consulta las 4 series actuales (`uf`, `dolar`, `euro`, `utm`), verifica que cada serie traiga datos (`if not serie`) para no caer con `IndexError` y calcula la conversión.
+- **`__mensaje_error(self, e)`**: Traduce `ErrorHTTP`, `ErrorRed` y `ErrorFormato` a mensajes comprensibles para el usuario final.
+
+## 5. Seguridad, roles y contraseñas (`modelo/usuario.py`, `modelo/roles.py`, `controlador/controlador_base.py`, `dao/dao_usuarios.py`)
+- **`normalizar_rol(rol)`** (`modelo/roles.py`): Unifica los roles a `ADMINISTRADOR`, `GERENTE` o `EMPLEADO` (aceptando alias como `ADMIN` u `OPERATIVO`) y lanza `ValueError` si encuentra un rol desconocido.
+- **`_exigir_gerente()` y `_exigir_administrador()`** (`controlador/controlador_base.py`): Refuerzan la autorización directamente en la capa controlador (defensa en profundidad), impidiendo que se ejecuten acciones administrativas aunque alguien evite los menús de consola.
+- **`Usuario.generar_hash_clave(clave)`** (`modelo/usuario.py`): Valida que la clave no supere los 72 bytes UTF-8 y genera un hash `bcrypt` con factor de costo `rounds=12` y sal aleatoria (`bcrypt.gensalt`).
+- **`Usuario.verificar_clave(clave, clave_guardada)`** (`modelo/usuario.py`): Verifica hashes `bcrypt` (`$2a$`, `$2b$`, `$2y$`) mediante `bcrypt.checkpw` y mantiene soporte temporal para `pbkdf2_sha256$` con `hmac.compare_digest` (comparación en tiempo constante) para no bloquear cuentas creadas antes de migrar a `bcrypt`.
+- **`DAOUsuarios.autenticar(...)`** (`dao/dao_usuarios.py`): Valida usuario y clave desde SQLite con consulta parametrizada (`?`). Si el usuario tenía clave antigua en texto plano o en `PBKDF2`, la actualiza automáticamente a `bcrypt` en la base de datos al iniciar sesión.
+- **`DAOUsuarios.listar_todos()`** (`dao/dao_usuarios.py`): Incluye `try/except ValueError` **dentro del bucle `for`** para omitir y registrar en `errores.log` (`logger.warning`) cualquier registro con rol corrupto sin interrumpir el listado de los demás usuarios, mientras `except Error` afuera protege fallos SQL retornando `[]`.
+
+## 6. Validaciones centralizadas y experiencia de usuario (`utils/validaciones.py`, controladores y vistas)
+- **`validar_clave(clave)`** (`utils/validaciones.py`): Se creó para unificar en un solo lugar las reglas de contraseña entre `ControladorUsuario`, `ControladorEmpleado`, `VistaUsuario` y `VistaEmpleado`: bloquea vacíos o `\x00`, exige mínimo 14 caracteres y limita a 72 bytes UTF-8 para evitar truncamiento silencioso en `bcrypt`.
+- **`validar_nombre`, `validar_telefono`, `validar_correo`, `validar_usuario`, `validar_salario`** (`utils/validaciones.py`): Devuelven `None` si el dato es válido o un texto de error específico. En particular, `validar_telefono` aplica el patrón chileno `r"(?:\+?56)?[2-9]\d{8}"` (9 dígitos con `+56` opcional) y `validar_salario` exige número finito `>= 0`.
+- **`validar_fecha_iso(texto, campo)`** (`utils/validaciones.py`): Se agregó tras detectar que Proyecto, Registro de Tiempo y Asignación de Proyectos aceptaban fechas inválidas como `"22-03-2015"` o `"2022"`. Combina `re.fullmatch(r"\d{4}-\d{2}-\d{2}", ...)` + `datetime.strptime(..., "%Y-%m-%d")` y devuelve `((texto, date), None)` para poder comparar fechas cronológicamente.
+- **`ControladorProyecto.__validar_datos(...)`** (`controlador/controlador_proyecto.py`): Reutilizada por `registrar_proyecto` y `actualizar_proyecto` para validar nombre obligatorio, formato `AAAA-MM-DD`, que `fechaFin` no sea anterior a `fechaInicio` (`fin_dt < inicio_dt`) y que `estado` sea `"Activo"` o `"Finalizado"`.
+- **`VistaEmpleado.__pedir_valido(...)` y `__pedir_opcional_entero(...)`** (`vista/vista_empleado.py`) + bucles `while True` en **`VistaUsuario.menu()`** (`vista/vista_usuario.py`): Se agregaron para validar **campo por campo al instante** cuando el usuario escribe un dato inválido (sin obligarlo a completar todo el formulario para recién enterarse del error al final), manteniendo igualmente las validaciones en los controladores como barrera de seguridad.
+
+---
+
+# Refactorizaciones y Justificación Técnica
+
+- **Separación de capas (`servicio/`, `utils/validador_api.py`, `utils/config.py`, `utils/validaciones.py`)**: Evita mezclar lógica HTTP, saneamiento de entradas, lectura de entorno y reglas de negocio en los controladores o vistas.
+- **Centralización de `validar_clave()`**: Eliminó validaciones repetidas y mensajes contradictorios entre `ControladorUsuario` y `ControladorEmpleado`.
+- **Migración progresiva a `bcrypt` con `requirements.txt`**: Mejora la seguridad del almacenamiento de contraseñas sin romper cuentas heredadas ni ocultar dependencias externas.
+- **Diagnóstico interno vs comunicación segura**: `errores.log` guarda el detalle técnico para depuración (`logger.error`/`logger.warning`), mientras que la interfaz de consola solo muestra mensajes claros al usuario.
+
+---
+
+# Verificación en Terminal (Comandos de Prueba y Qué Demuestran)
+
+1. **Compilación completa de todos los módulos Python**:
+   ```powershell
+   python -m compileall -q .
+   ```
+   *Qué demuestra*: Que no existen errores de sintaxis ni de indentación en ningún archivo `.py` del proyecto (retorna código de salida `0` sin errores).
+
+2. **Verificación de carga de `.env` y listado seguro desde SQLite**:
+   ```powershell
+   python -c "from utils.config import cargar_env; cargar_env(); from servicio.servicio_indicadores import API_PRINCIPAL, API_RESPALDO, API_TIMEOUT; from dao.dao_usuarios import DAOUsuarios; print('ENV:', API_PRINCIPAL, API_RESPALDO, API_TIMEOUT); print('USUARIOS:', len(DAOUsuarios().listar_todos()))"
+   ```
+   *Qué demuestra*: Que `.env` se carga correctamente antes de leer las constantes de API (`https://mindicador.cl/api https://findic.cl/api 10`) y que `DAOUsuarios().listar_todos()` reconstruye los usuarios de `ecotech.db` sin lanzar `ValueError`.
+
+3. **Verificación de hashing `bcrypt` (generación y validación)**:
+   ```powershell
+   python -c "from modelo.usuario import Usuario; h = Usuario.generar_hash_clave('ClaveSegura12345'); print(h[:4], Usuario.verificar_clave('ClaveSegura12345', h), Usuario.verificar_clave('otra', h))"
+   ```
+   *Qué demuestra*: Que el hash generado comienza con `$2b$` (prefijo estándar de `bcrypt`), valida `True` con la clave correcta y `False` con una clave incorrecta.
+
+4. **Verificación de reglas de entrada (`validar_clave` y `validador_api`)**:
+   ```powershell
+   python -c "from utils.validaciones import validar_clave; from utils.validador_api import validar_indicador, validar_fecha, validar_anio, validar_monto; print('clave_corta:', validar_clave('123')); print('clave_73:', validar_clave('a'*73)); print('clave_ok:', validar_clave('ClaveSegura12345')); print('api_ok:', validar_indicador(' UF '), validar_fecha('15-03-2024'), validar_anio('2024'), validar_monto('1000')); print('api_bad:', validar_indicador('btc'), validar_fecha('31-02-2024'), validar_monto('nan'))"
+   ```
+   *Qué demuestra*: Que las validaciones rechazan claves cortas (`< 14`), claves sobre `72 bytes`, indicadores fuera de lista blanca (`btc`), fechas inexistentes (`31-02-2024`) y montos `nan`, mientras sanean y aceptan entradas válidas (`' UF '` -> `'uf'`).
+
+# Participación del Equipo y Aporte de la IA
+
+Estimamos que más del 75% del código fue escrito, corregido, probado e integrado por el equipo. Utilizamos la IA como apoyo técnico para acelerar borradores, revisar vulnerabilidades y contrastar enfoques de seguridad; cada sugerencia fue revisada, depurada, probada en terminal y adaptada a las decisiones arquitectónicas del proyecto.
